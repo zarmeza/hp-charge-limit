@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# hp-charge-limit — keep an HP laptop battery at or below STOP% while on AC.
+#
+# Uses HP's own ACPI charge-mode methods (GBCO/SBCO, WMI command 0x2B) through
+# acpi_call. Mode 5 inhibits charging (EC BDVO = 0x45); mode 0 restores normal
+# charging (BDVO = 0x40). No EC register poking, no patched kernel.
+#
+# Usage: hp-charge-limit [--status|--restore]
+# Env:   HPL_STOP (80), HPL_START (75), HPL_POLL (20)
+#
+# The AC stays connected; the EC simply stops charging. That is the whole
+# point: no 80<->20 cycling, no 100% dwell.
+
+set -uo pipefail
+
+STOP=${HPL_STOP:-80}
+START=${HPL_START:-75}
+POLL=${HPL_POLL:-20}
+CALL=${HPL_CALL:-/proc/acpi/call}
+RUNDIR=${HPL_RUNDIR:-/run/hp-charge-limit}
+
+find_ac() {
+    local d
+    for d in /sys/class/power_supply/ACAD \
+             /sys/class/power_supply/AC* \
+             /sys/class/power_supply/ADP* \
+             /sys/class/power_supply/*; do
+        [[ -r $d/online ]] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+find_bat() {
+    local d
+    for d in /sys/class/power_supply/BAT0 \
+             /sys/class/power_supply/BAT* \
+             /sys/class/power_supply/*; do
+        [[ -r $d/capacity && -r $d/status ]] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+AC=${HPL_AC:-$(find_ac || true)}
+BAT=${HPL_BAT:-$(find_bat || true)}
+
+log() { printf '%s hp-charge-limit: %s\n' "$(date -Is)" "$*" >&2; }
+
+acpi_exec() {
+    local cmd=$1 out
+    [[ -n ${CALL:-} && -w $CALL ]] || { log "cannot write $CALL"; return 1; }
+    if ! printf '%s\n' "$cmd" > "$CALL" 2>/dev/null; then
+        log "ACPI call failed: $cmd"
+        return 1
+    fi
+    out=$(tr -d '\000' < "$CALL" 2>/dev/null) || return 1
+    printf '%s' "$out"
+}
+
+# GBCO returns: [0x0, 0x4, {0xMODE, 0xff, 0xFLAGS, 0x00}]
+parse_mode() {
+    local out=$1
+    if [[ $out =~ ^\[0x0,[[:space:]]*0x4,[[:space:]]*\{0x([0-9a-fA-F]+) ]]; then
+        printf '%d' "$((16#${BASH_REMATCH[1]}))"
+        return 0
+    fi
+    return 1
+}
+
+get_mode() {
+    local out
+    out=$(acpi_exec '\_SB.WMID.GBCO') || return 1
+    parse_mode "$out"
+}
+
+set_inhibit() {
+    local out
+    out=$(acpi_exec '\_SB.WMID.SBCO 0 5 0 0') || return 1
+    [[ $out == \[0x0,* ]] || { log "inhibit rejected: $out"; return 1; }
+}
+
+set_auto() {
+    local out
+    out=$(acpi_exec '\_SB.WMID.SBCC 0 0 0 0') || return 1
+    [[ $out == \[0x0,* ]] || { log "auto (SBCC) rejected: $out"; return 1; }
+    out=$(acpi_exec '\_SB.WMID.SBCO 0 0 0 0') || return 1
+    [[ $out == \[0x0,* ]] || { log "auto (SBCO) rejected: $out"; return 1; }
+}
+
+mode_name() {
+    case $1 in
+        0) printf 'auto (charging allowed)' ;;
+        2) printf 'force-discharge' ;;
+        4) printf 'inhibit (charge blocked)' ;;
+        5) printf 'ship mode' ;;
+        6) printf 'storage mode' ;;
+        *) printf 'mode %s' "$1" ;;
+    esac
+}
+
+# decide AC_ONLINE CAPACITY MODE -> auto | inhibit | hold
+# 0/4 are the only modes this daemon creates; anything else is left alone.
+decide() {
+    local ac=$1 cap=$2 mode=$3
+    [[ -n $mode ]] || { printf 'hold'; return 0; }
+    if [[ $ac != 1 ]]; then printf 'auto'; return 0; fi
+    if (( cap >= STOP )); then printf 'inhibit'; return 0; fi
+    if (( cap <= START )); then printf 'auto'; return 0; fi
+    case $mode in
+        0) printf 'auto' ;;
+        4) printf 'inhibit' ;;
+        *) printf 'hold' ;;
+    esac
+}
+
+main_loop() {
+    local ac cap mode want newmode prev_want="" warned=""
+
+    [[ -n $AC && -n $BAT ]] || { log "cannot find an AC or battery supply"; exit 1; }
+
+    mkdir -p "$RUNDIR" 2>/dev/null || true
+    exec 9>"$RUNDIR/lock" || { log "cannot open lock file"; exit 1; }
+    if ! flock -n 9; then
+        log "another instance is already running"
+        exit 1
+    fi
+
+    trap 'log "stopping; restoring auto charging"; set_auto || true; exit 0' TERM INT
+
+    log "starting: stop=${STOP}% start=${START}% poll=${POLL}s ac=$AC bat=$BAT"
+
+    while :; do
+        ac=$(cat "$AC/online" 2>/dev/null) || ac=""
+        cap=$(cat "$BAT/capacity" 2>/dev/null) || cap=""
+        if [[ -z $ac || -z $cap ]]; then
+            log "cannot read AC state or capacity"
+            sleep "$POLL" &
+            wait $!
+            continue
+        fi
+
+        mode=$(get_mode) || mode=""
+        want=$(decide "$ac" "$cap" "$mode")
+
+        if [[ $want == hold ]]; then
+            if [[ -z $mode && $warned != read ]]; then
+                log "cannot read charge mode; holding current state"
+                warned=read
+            elif [[ -n $mode && $mode != 0 && $mode != 4 && $warned != "mode-$mode" ]]; then
+                log "unexpected charge mode $mode ($(mode_name "$mode")); leaving it alone"
+                warned="mode-$mode"
+            fi
+        elif [[ $want == inhibit && $mode != 4 ]]; then
+            if [[ $prev_want != inhibit ]]; then
+                log "capacity ${cap}% on AC: blocking charge (mode ${mode})"
+            fi
+            if set_inhibit; then
+                newmode=$(get_mode) || newmode=""
+                [[ $newmode == 4 ]] || log "warning: inhibit readback was '${newmode:-unreadable}'"
+            fi
+            warned=""
+        elif [[ $want == auto && $mode != 0 ]]; then
+            if [[ $prev_want != auto ]]; then
+                if [[ $ac == 1 ]]; then
+                    log "capacity ${cap}% on AC: allowing charge (mode ${mode})"
+                else
+                    log "AC offline: restoring auto charging"
+                fi
+            fi
+            if set_auto; then
+                newmode=$(get_mode) || newmode=""
+                [[ $newmode == 0 ]] || log "warning: auto readback was '${newmode:-unreadable}'"
+            fi
+            warned=""
+        fi
+
+        prev_want=$want
+        sleep "$POLL" &
+        wait $!
+    done
+}
+
+cmd_status() {
+    local ac cap mode
+    ac=$(cat "$AC/online" 2>/dev/null) || ac="?"
+    cap=$(cat "$BAT/capacity" 2>/dev/null) || cap="?"
+    if mode=$(get_mode); then :; else mode=""; fi
+    printf 'AC online : %s\n' "$ac"
+    printf 'Capacity  : %s%%\n' "$cap"
+    if [[ -n $mode ]]; then
+        printf 'Mode      : %s (%s)\n' "$mode" "$(mode_name "$mode")"
+    else
+        printf 'Mode      : unreadable (run as root; is acpi_call loaded?)\n'
+    fi
+    printf 'Thresholds: stop %s%%, resume %s%%\n' "$STOP" "$START"
+}
+
+cmd_restore() {
+    if set_auto; then
+        log "auto charging restored"
+    else
+        log "failed to restore auto charging"
+        return 1
+    fi
+}
+
+if [[ ${HPL_LIB_ONLY:-0} == 1 ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+case ${1:-} in
+    --status) cmd_status ;;
+    --restore) cmd_restore ;;
+    "") main_loop ;;
+    *) printf 'usage: %s [--status|--restore]\n' "$0" >&2; exit 2 ;;
+esac

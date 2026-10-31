@@ -1,0 +1,18 @@
+[Unit]
+Description=HP battery charge limit (80% cap via HP WMI)
+After=systemd-modules-load.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+RuntimeDirectory=hp-charge-limit
+ExecStartPre=/usr/sbin/modprobe acpi_call
+ExecStart=/usr/local/sbin/hp-charge-limit
+ExecStopPost=/usr/local/sbin/hp-charge-limit --restore
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
